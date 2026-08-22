@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.Threading;
@@ -12,20 +11,22 @@ namespace DellG15FanControl
         private readonly AppSettings settings;
         private readonly System.Windows.Forms.Timer timer;
         private readonly NotifyIcon tray;
-        private LegacyDiagsTransport transport;
+        private IDiagsTransport transport;
         private FanFirmware firmware;
         private int busy;
         private bool exiting;
-        private bool curveEnabled;
-        private bool updatingStartup;
-        private FanState? curveState;
-
-        private Label title, platform, cpuTemp, gpuTemp, fan0Rpm, fan1Rpm, fan0State, fan1State;
-        private Label status, modeLabel, curveLabel, startupLabel, languageLabel;
-        private Button autoButton, offButton, lowButton, highButton, curveButton;
-        private NumericUpDown offMax, lowMax, highMax;
-        private CheckBox startup, startMinimized;
+        private bool thermalOverride;
+        private FanState? selectedManualState;
+        private Telemetry lastTelemetry;
+        private Label cpu, gpu, fan0, fan1, status, thresholdText;
+        private Button offButton, lowButton, highButton;
+        private TrackBar threshold;
         private ComboBox language;
+        private Button menuButton;
+        private ContextMenuStrip appMenu;
+        private ToolStripMenuItem startupMenuItem, exitMenuItem;
+        private MenuItem trayStartupItem;
+        private bool allowExit;
 
         internal MainForm(bool launchedMinimized)
         {
@@ -40,15 +41,16 @@ namespace DellG15FanControl
             tray.Text = "Dell G15 Fan Control";
             tray.Visible = true;
             tray.DoubleClick += delegate { ShowFromTray(); };
+            trayStartupItem = new MenuItem("Start with Windows / 开机自启动", delegate { ToggleStartup(); });
             tray.ContextMenu = new ContextMenu(new MenuItem[] {
                 new MenuItem("Open / 打开", delegate { ShowFromTray(); }),
-                new MenuItem("Exit / 退出", delegate { Close(); }) });
-
-            Shown += delegate
-            {
+                trayStartupItem,
+                new MenuItem("Exit / 退出", delegate { RequestExit(); }) });
+            Shown += delegate {
                 ConnectAsync();
                 try { Program.StartWatchdog(); } catch { }
-                if (launchedMinimized && settings.StartMinimized) BeginInvoke(new Action(HideToTray));
+                RefreshStartupState();
+                if (launchedMinimized) BeginInvoke(new Action(HideToTray));
             };
             Resize += delegate { if (WindowState == FormWindowState.Minimized) HideToTray(); };
             FormClosing += OnClosing;
@@ -57,73 +59,86 @@ namespace DellG15FanControl
         private void InitializeUi()
         {
             Text = "Dell G15 Fan Control";
-            ClientSize = new Size(720, 510);
-            MinimumSize = new Size(700, 520);
+            ClientSize = new Size(790, 220);
+            MinimumSize = new Size(700, 245);
+            MaximumSize = new Size(1200, 360);
             StartPosition = FormStartPosition.CenterScreen;
-            Font = new Font("Segoe UI", 10F);
+            Font = new Font("Segoe UI", 9.5F);
             BackColor = Color.FromArgb(246, 248, 251);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleDimensions = new SizeF(96F, 96F);
+            MaximizeBox = false;
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill; root.Padding = new Padding(14, 8, 14, 7);
+            root.ColumnCount = 1; root.RowCount = 4;
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 43F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 29F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 19F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 9F));
+            Controls.Add(root);
 
-            title = NewLabel(18F, FontStyle.Bold); title.Location = new Point(24, 18); title.AutoSize = true;
-            platform = NewLabel(9F, FontStyle.Regular); platform.Location = new Point(27, 55); platform.AutoSize = true;
+            TableLayoutPanel readings = new TableLayoutPanel();
+            readings.Dock = DockStyle.Fill; readings.ColumnCount = 4;
+            for (int i = 0; i < 4; i++) readings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25F));
+            cpu = Reading("CPU\n-- °C"); gpu = Reading("GPU\n-- °C");
+            fan0 = Reading("Fan 1\n-- RPM"); fan1 = Reading("Fan 2\n-- RPM");
+            readings.Controls.Add(cpu, 0, 0); readings.Controls.Add(gpu, 1, 0);
+            readings.Controls.Add(fan0, 2, 0); readings.Controls.Add(fan1, 3, 0);
+            root.Controls.Add(readings, 0, 0);
 
-            GroupBox monitor = new GroupBox(); monitor.Location = new Point(24, 86); monitor.Size = new Size(672, 142);
-            monitor.Text = "Monitor"; Controls.Add(monitor);
-            cpuTemp = ValueLabel(); cpuTemp.Location = new Point(28, 34);
-            gpuTemp = ValueLabel(); gpuTemp.Location = new Point(188, 34);
-            fan0Rpm = ValueLabel(); fan0Rpm.Location = new Point(348, 34);
-            fan1Rpm = ValueLabel(); fan1Rpm.Location = new Point(508, 34);
-            fan0State = NewLabel(9F, FontStyle.Regular); fan0State.Location = new Point(348, 93); fan0State.AutoSize = true;
-            fan1State = NewLabel(9F, FontStyle.Regular); fan1State.Location = new Point(508, 93); fan1State.AutoSize = true;
-            monitor.Controls.AddRange(new Control[] { cpuTemp, gpuTemp, fan0Rpm, fan1Rpm, fan0State, fan1State });
-
-            modeLabel = NewLabel(10F, FontStyle.Bold); modeLabel.Location = new Point(26, 246); modeLabel.AutoSize = true; Controls.Add(modeLabel);
-            autoButton = ModeButton(24, 276, Color.FromArgb(38, 126, 78));
-            offButton = ModeButton(158, 276, Color.FromArgb(70, 74, 82));
-            lowButton = ModeButton(292, 276, Color.FromArgb(44, 111, 170));
-            highButton = ModeButton(426, 276, Color.FromArgb(197, 76, 49));
-            curveButton = ModeButton(560, 276, Color.FromArgb(121, 78, 171));
-            autoButton.Click += delegate { ApplyStateAsync(FanState.Auto); };
-            offButton.Click += delegate { ConfirmOff(); };
-            lowButton.Click += delegate { ApplyStateAsync(FanState.Low); };
-            highButton.Click += delegate { ApplyStateAsync(FanState.High); };
-            curveButton.Click += delegate { ToggleCurve(); };
-
-            curveLabel = NewLabel(9F, FontStyle.Regular); curveLabel.Location = new Point(26, 340); curveLabel.AutoSize = true; Controls.Add(curveLabel);
-            offMax = Threshold(240, 335, settings.OffMax); lowMax = Threshold(340, 335, settings.LowMax); highMax = Threshold(440, 335, settings.HighMax);
-            Controls.AddRange(new Control[] { offMax, lowMax, highMax });
-            Label marks = NewLabel(9F, FontStyle.Regular); marks.Location = new Point(540, 340); marks.AutoSize = true; marks.Text = "°C"; Controls.Add(marks);
-
-            startupLabel = NewLabel(10F, FontStyle.Bold); startupLabel.Location = new Point(26, 385); startupLabel.AutoSize = true; Controls.Add(startupLabel);
-            startup = new CheckBox(); startup.Location = new Point(185, 383); startup.AutoSize = true; startup.Checked = settings.StartWithWindows; Controls.Add(startup);
-            startMinimized = new CheckBox(); startMinimized.Location = new Point(390, 383); startMinimized.AutoSize = true; startMinimized.Checked = settings.StartMinimized; Controls.Add(startMinimized);
-            startup.CheckedChanged += delegate { UpdateStartup(); };
-            startMinimized.CheckedChanged += delegate { settings.StartMinimized = startMinimized.Checked; settings.Save(); };
-
-            languageLabel = NewLabel(9F, FontStyle.Regular); languageLabel.Location = new Point(26, 427); languageLabel.AutoSize = true; Controls.Add(languageLabel);
-            language = new ComboBox(); language.DropDownStyle = ComboBoxStyle.DropDownList; language.Location = new Point(100, 423); language.Width = 155;
-            language.Items.AddRange(new object[] { "中文", "English" }); language.SelectedIndex = settings.Language == "en-US" ? 1 : 0;
+            TableLayoutPanel controls = new TableLayoutPanel();
+            controls.Dock = DockStyle.Fill; controls.ColumnCount = 6;
+            controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 17F));
+            controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 17F));
+            controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 17F));
+            controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 31F));
+            controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 11F));
+            controls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 7F));
+            offButton = ModeButton(Color.FromArgb(70, 74, 82));
+            lowButton = ModeButton(Color.FromArgb(44, 111, 170));
+            highButton = ModeButton(Color.FromArgb(197, 76, 49));
+            offButton.Click += delegate { SelectManualState(FanState.Off); };
+            lowButton.Click += delegate { SelectManualState(FanState.Low); };
+            highButton.Click += delegate { SelectManualState(FanState.High); };
+            controls.Controls.Add(offButton, 0, 0); controls.Controls.Add(lowButton, 1, 0); controls.Controls.Add(highButton, 2, 0);
+            threshold = new TrackBar(); threshold.Dock = DockStyle.Fill;
+            threshold.Minimum = 60; threshold.Maximum = 100; threshold.TickFrequency = 5;
+            threshold.SmallChange = 1; threshold.LargeChange = 5; threshold.Value = settings.EmergencyThreshold;
+            threshold.ValueChanged += delegate { settings.EmergencyThreshold = threshold.Value; settings.Save(); UpdateThresholdText(); };
+            controls.Controls.Add(threshold, 3, 0);
+            language = new ComboBox(); language.Dock = DockStyle.Fill; language.DropDownStyle = ComboBoxStyle.DropDownList;
+            language.Items.AddRange(new object[] { "中", "EN" }); language.SelectedIndex = settings.Language == "en-US" ? 1 : 0;
             language.SelectedIndexChanged += delegate { settings.Language = language.SelectedIndex == 1 ? "en-US" : "zh-CN"; settings.Save(); ApplyLanguage(); };
-            Controls.Add(language);
-
-            status = NewLabel(9F, FontStyle.Regular); status.Location = new Point(26, 466); status.Size = new Size(665, 30); status.ForeColor = Color.FromArgb(80, 85, 95); Controls.Add(status);
-            Controls.Add(title); Controls.Add(platform);
+            controls.Controls.Add(language, 4, 0);
+            menuButton = new Button(); menuButton.Dock = DockStyle.Fill; menuButton.Text = "⋮";
+            menuButton.Font = new Font("Segoe UI", 15F, FontStyle.Bold); menuButton.FlatStyle = FlatStyle.Flat;
+            menuButton.FlatAppearance.BorderSize = 0; menuButton.Margin = new Padding(4, 5, 0, 5);
+            controls.Controls.Add(menuButton, 5, 0); root.Controls.Add(controls, 0, 1);
+            appMenu = new ContextMenuStrip();
+            startupMenuItem = new ToolStripMenuItem(); startupMenuItem.CheckOnClick = false;
+            startupMenuItem.Click += delegate { ToggleStartup(); };
+            exitMenuItem = new ToolStripMenuItem(); exitMenuItem.Click += delegate { RequestExit(); };
+            appMenu.Items.Add(startupMenuItem); appMenu.Items.Add(new ToolStripSeparator()); appMenu.Items.Add(exitMenuItem);
+            appMenu.Opening += delegate { RefreshStartupState(); };
+            menuButton.Click += delegate { appMenu.Show(menuButton, new Point(0, menuButton.Height)); };
+            thresholdText = new Label(); thresholdText.Dock = DockStyle.Fill; thresholdText.TextAlign = ContentAlignment.MiddleCenter;
+            thresholdText.ForeColor = Color.FromArgb(65, 70, 80); root.Controls.Add(thresholdText, 0, 2);
+            status = new Label(); status.Dock = DockStyle.Fill; status.TextAlign = ContentAlignment.MiddleLeft;
+            status.AutoEllipsis = true; status.ForeColor = Color.FromArgb(80, 85, 95); root.Controls.Add(status, 0, 3);
         }
 
-        private Label NewLabel(float size, FontStyle style)
+        private Label Reading(string text)
         {
-            Label value = new Label(); value.Font = new Font("Segoe UI", size, style); value.ForeColor = Color.FromArgb(35, 40, 48); return value;
+            Label label = new Label(); label.Dock = DockStyle.Fill; label.Text = text;
+            label.TextAlign = ContentAlignment.MiddleCenter; label.Font = new Font("Segoe UI", 15F, FontStyle.Bold);
+            label.ForeColor = Color.FromArgb(35, 40, 48); return label;
         }
-        private Label ValueLabel() { Label value = NewLabel(18F, FontStyle.Bold); value.Size = new Size(145, 60); return value; }
-        private Button ModeButton(int x, int y, Color color)
+
+        private Button ModeButton(Color color)
         {
-            Button button = new Button(); button.Location = new Point(x, y); button.Size = new Size(116, 44);
-            button.FlatStyle = FlatStyle.Flat; button.FlatAppearance.BorderSize = 0; button.BackColor = color; button.ForeColor = Color.White;
-            Controls.Add(button); return button;
-        }
-        private NumericUpDown Threshold(int x, int y, int value)
-        {
-            NumericUpDown n = new NumericUpDown(); n.Location = new Point(x, y); n.Size = new Size(72, 30); n.Minimum = 30; n.Maximum = 95; n.Value = value;
-            n.ValueChanged += delegate { SaveThresholds(); }; return n;
+            Button button = new Button(); button.Dock = DockStyle.Fill; button.Margin = new Padding(4, 5, 4, 5);
+            button.FlatStyle = FlatStyle.Flat; button.FlatAppearance.BorderSize = 0;
+            button.BackColor = color; button.ForeColor = Color.White; return button;
         }
 
         private bool English { get { return settings.Language == "en-US"; } }
@@ -131,177 +146,164 @@ namespace DellG15FanControl
 
         private void ApplyLanguage()
         {
-            title.Text = T("Dell G15 5515 真风扇控制", "Dell G15 5515 True Fan Control");
-            platform.Text = T("Dell 官方 LegacyDiags 通道 · BIOS 1.30.0", "Dell LegacyDiags channel · BIOS 1.30.0");
-            modeLabel.Text = T("风扇档位（同时控制两只风扇）", "Fan mode (controls both fans)");
-            autoButton.Text = T("自动", "Auto"); offButton.Text = T("停转", "Off"); lowButton.Text = T("低速", "Low");
-            highButton.Text = T("高速", "High"); curveButton.Text = curveEnabled ? T("曲线：开", "Curve: ON") : T("曲线", "Curve");
-            curveLabel.Text = T("曲线阈值： 停转≤       低速≤       高速≤       其余自动", "Curve: Off≤          Low≤          High≤          else Auto");
-            startupLabel.Text = T("系统集成", "System integration"); startup.Text = T("开机自启动", "Start with Windows");
-            startMinimized.Text = T("启动后最小化", "Start minimized"); languageLabel.Text = T("语言", "Language");
-            if (status.Text.Length == 0) status.Text = T("正在连接……", "Connecting...");
+            offButton.Text = "0 RPM"; lowButton.Text = T("Dell 低速", "Dell Low"); highButton.Text = T("Dell 高速", "Dell High");
+            startupMenuItem.Text = T("开机自启动并常驻托盘", "Start with Windows in tray");
+            exitMenuItem.Text = T("退出程序并恢复 BIOS 自动", "Exit and restore BIOS Auto");
+            UpdateThresholdText();
+            if (status.Text.Length == 0) status.Text = T("正在连接 Dell LegacyDiags……", "Connecting to Dell LegacyDiags...");
+        }
+
+        private void UpdateThresholdText()
+        {
+            thresholdText.Text = T("CPU 与 GPU 同时达到 ", "BIOS Auto when both CPU and GPU reach ") +
+                threshold.Value.ToString(CultureInfo.InvariantCulture) + T(" °C：BIOS 临时接管；降温后恢复所选档",
+                " °C; selected mode resumes after cooling");
         }
 
         private void ConnectAsync()
         {
             SetButtons(false);
-            ThreadPool.QueueUserWorkItem(delegate
-            {
-                try
-                {
+            ThreadPool.QueueUserWorkItem(delegate {
+                try {
                     PlatformPolicy.DemandExactMatch();
-                    transport = LegacyDiagsTransport.Connect();
-                    firmware = new FanFirmware(transport);
-                    int revision = firmware.VerifyRevision();
-                    BeginInvoke(new Action(delegate
-                    {
-                        status.Text = T("已连接。协议版本：", "Connected. Protocol revision: ") + revision.ToString(CultureInfo.InvariantCulture);
+                    transport = PowerShellCimTransport.Connect();
+                    firmware = new FanFirmware(transport); firmware.VerifyRevision();
+                    BeginInvoke(new Action(delegate {
+                        status.Text = T("已连接；请选择手动档位。", "Connected; select a manual mode.");
                         SetButtons(true); timer.Start(); RefreshAsync();
                     }));
-                }
-                catch (Exception ex) { BeginInvoke(new Action(delegate { status.Text = T("连接失败：", "Connection failed: ") + ex.Message; })); }
+                } catch (Exception ex) { BeginInvoke(new Action(delegate { status.Text = T("连接失败：", "Connection failed: ") + ex.Message; })); }
             });
         }
 
         private void RefreshAsync()
         {
             if (firmware == null || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
-            ThreadPool.QueueUserWorkItem(delegate
-            {
-                try
-                {
-                    Telemetry value = firmware.ReadTelemetry();
-                    if (curveEnabled) EvaluateCurve(value);
-                    BeginInvoke(new Action(delegate { Display(value); }));
-                }
-                catch (Exception ex) { if (!exiting) BeginInvoke(new Action(delegate { status.Text = T("刷新失败：", "Refresh failed: ") + ex.Message; })); }
+            ThreadPool.QueueUserWorkItem(delegate {
+                try {
+                    Telemetry value = firmware.ReadTelemetry(); lastTelemetry = value;
+                    ApplyThermalOverride(value); BeginInvoke(new Action(delegate { Display(value); }));
+                } catch (Exception ex) { if (!exiting) BeginInvoke(new Action(delegate { status.Text = T("刷新失败：", "Refresh failed: ") + ex.Message; })); }
                 finally { Interlocked.Exchange(ref busy, 0); }
             });
         }
 
         private void Display(Telemetry value)
         {
-            cpuTemp.Text = "CPU\n" + value.CpuC + " °C";
-            gpuTemp.Text = "GPU\n" + (value.GpuC.HasValue ? value.GpuC.Value + " °C" : "N/A");
-            fan0Rpm.Text = T("风扇 1\n", "Fan 1\n") + value.Fan0.Rpm + " RPM";
-            fan1Rpm.Text = T("风扇 2\n", "Fan 2\n") + value.Fan1.Rpm + " RPM";
-            fan0State.Text = T("档位：", "State: ") + StateName(value.Fan0.State);
-            fan1State.Text = T("档位：", "State: ") + StateName(value.Fan1.State);
-            status.Text = T("最后刷新：", "Last refresh: ") + value.Time.ToString("HH:mm:ss") + (curveEnabled ? T(" · 曲线控制中", " · Curve active") : "");
+            cpu.Text = "CPU\n" + value.CpuC + " °C";
+            gpu.Text = "GPU\n" + (value.GpuC.HasValue ? value.GpuC.Value + " °C" : "N/A");
+            fan0.Text = T("风扇 1", "Fan 1") + "\n" + value.Fan0.Rpm + " RPM";
+            fan1.Text = T("风扇 2", "Fan 2") + "\n" + value.Fan1.Rpm + " RPM";
+            if (thermalOverride) status.Text = T("BIOS 自动接管中 · ", "BIOS Auto override · ") + value.Time.ToString("HH:mm:ss");
+            else if (selectedManualState.HasValue) status.Text = T("手动档：", "Manual: ") + StateName(selectedManualState.Value) + " · " + value.Time.ToString("HH:mm:ss");
+            else status.Text = T("当前：", "Current: ") + StateName(value.Fan0.State) + T("；请选择手动档。", "; select a manual mode.");
         }
 
         private string StateName(FanState state)
         {
-            if (state == FanState.Off) return T("停转", "Off"); if (state == FanState.Low) return T("低速", "Low");
-            if (state == FanState.High) return T("高速", "High"); return T("自动", "Auto");
+            if (state == FanState.Off) return "0 RPM";
+            if (state == FanState.Low) return T("Dell 低速", "Dell Low");
+            if (state == FanState.High) return T("Dell 高速", "Dell High");
+            return T("BIOS 自动", "BIOS Auto");
         }
 
-        private void ConfirmOff()
+        private void SelectManualState(FanState state)
         {
-            DialogResult result = MessageBox.Show(T("将两只内置风扇设为 0 RPM。关闭程序会恢复自动。继续吗？",
-                "Set both internal fans to 0 RPM. Closing the app restores Auto. Continue?"), Text,
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-            if (result == DialogResult.Yes) ApplyStateAsync(FanState.Off);
-        }
-
-        private void ApplyStateAsync(FanState state)
-        {
-            curveEnabled = false; curveState = null; ApplyLanguage();
             if (firmware == null || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
-            SetButtons(false); status.Text = T("正在切换……", "Switching...");
-            ThreadPool.QueueUserWorkItem(delegate
-            {
-                try
-                {
-                    firmware.SetBoth(state);
-                    BeginInvoke(new Action(delegate { status.Text = T("已切换到：", "Mode applied: ") + StateName(state); SetButtons(true); }));
-                }
-                catch (Exception ex) { BeginInvoke(new Action(delegate { status.Text = T("切换失败：", "Switch failed: ") + ex.Message; SetButtons(true); })); }
+            selectedManualState = state; SetSelectedButton(state); SetButtons(false);
+            ThreadPool.QueueUserWorkItem(delegate {
+                try {
+                    bool hot = IsBothHot(lastTelemetry); firmware.SetBoth(hot ? FanState.Auto : state); thermalOverride = hot;
+                    BeginInvoke(new Action(delegate {
+                        status.Text = hot ? T("已记住所选档；当前由 BIOS 自动接管。", "Mode saved; BIOS Auto is active while both sensors are hot.")
+                            : T("已切换到：", "Applied: ") + StateName(state); SetButtons(true);
+                    }));
+                } catch (Exception ex) { BeginInvoke(new Action(delegate { status.Text = T("切换失败：", "Switch failed: ") + ex.Message; SetButtons(true); })); }
                 finally { Interlocked.Exchange(ref busy, 0); }
             });
         }
 
-        private void ToggleCurve()
+        private void ApplyThermalOverride(Telemetry value)
         {
-            SaveThresholds(); curveEnabled = !curveEnabled; curveState = null; ApplyLanguage();
-            status.Text = curveEnabled ? T("曲线已启用。", "Curve enabled.") : T("曲线已停止；保留当前档位。", "Curve stopped; current state retained.");
+            if (!selectedManualState.HasValue || !value.GpuC.HasValue) return;
+            bool hot = IsBothHot(value);
+            if (hot && !thermalOverride) { firmware.SetBoth(FanState.Auto); thermalOverride = true; }
+            else if (!hot && thermalOverride) { firmware.SetBoth(selectedManualState.Value); thermalOverride = false; }
         }
 
-        private void EvaluateCurve(Telemetry value)
+        private bool IsBothHot(Telemetry value)
         {
-            int temp = value.GpuC.HasValue ? Math.Max(value.CpuC, value.GpuC.Value) : value.CpuC;
-            FanState desired = temp <= settings.OffMax ? FanState.Off : temp <= settings.LowMax ? FanState.Low : temp <= settings.HighMax ? FanState.High : FanState.Auto;
-            if (!curveState.HasValue || curveState.Value != desired)
-            {
-                firmware.SetBoth(desired);
-                curveState = desired;
-            }
+            return value != null && value.GpuC.HasValue && value.CpuC >= threshold.Value && value.GpuC.Value >= threshold.Value;
         }
 
-        private void SaveThresholds()
+        private void SetSelectedButton(FanState state)
         {
-            if (offMax == null) return;
-            int a = (int)offMax.Value, b = (int)lowMax.Value, c = (int)highMax.Value;
-            if (!(a < b && b < c)) { status.Text = T("阈值必须依次升高。", "Thresholds must increase."); return; }
-            settings.OffMax = a; settings.LowMax = b; settings.HighMax = c; settings.Save();
+            offButton.FlatAppearance.BorderSize = state == FanState.Off ? 3 : 0;
+            lowButton.FlatAppearance.BorderSize = state == FanState.Low ? 3 : 0;
+            highButton.FlatAppearance.BorderSize = state == FanState.High ? 3 : 0;
+            offButton.FlatAppearance.BorderColor = lowButton.FlatAppearance.BorderColor = highButton.FlatAppearance.BorderColor = Color.Gold;
         }
 
-        private void UpdateStartup()
-        {
-            if (!IsHandleCreated || updatingStartup) return;
-            try
-            {
-                StartupTask.SetEnabled(startup.Checked);
-                settings.StartWithWindows = startup.Checked; settings.Save();
-                status.Text = startup.Checked ? T("已设置开机自启动。", "Startup enabled.") : T("已取消开机自启动。", "Startup disabled.");
-            }
-            catch (Exception ex)
-            {
-                updatingStartup = true;
-                startup.Checked = !startup.Checked;
-                updatingStartup = false;
-                status.Text = T("启动项设置失败：", "Startup setting failed: ") + ex.Message;
-            }
-        }
-
-        private void SetButtons(bool enabled)
-        {
-            autoButton.Enabled = offButton.Enabled = lowButton.Enabled = highButton.Enabled = curveButton.Enabled = enabled;
-        }
+        private void SetButtons(bool enabled) { offButton.Enabled = lowButton.Enabled = highButton.Enabled = enabled; }
         private void HideToTray() { Hide(); ShowInTaskbar = false; }
         private void ShowFromTray() { Show(); ShowInTaskbar = true; WindowState = FormWindowState.Normal; Activate(); }
 
-        private void OnClosing(object sender, FormClosingEventArgs e)
+        private void RefreshStartupState()
         {
-            if (exiting) return;
-            exiting = true; timer.Stop(); curveEnabled = false; status.Text = T("正在恢复 BIOS 自动模式……", "Restoring BIOS Auto...");
-            try { if (firmware != null) firmware.SetBoth(FanState.Auto); }
+            string reason;
+            bool enabled = StartupTask.VerifyExact(out reason);
+            startupMenuItem.Checked = enabled;
+            trayStartupItem.Checked = enabled;
+            settings.StartWithWindows = enabled;
+            settings.Save();
+        }
+
+        private void ToggleStartup()
+        {
+            try
+            {
+                string reason;
+                bool current = StartupTask.VerifyExact(out reason);
+                StartupTask.SetEnabled(!current);
+                bool verified = StartupTask.VerifyExact(out reason);
+                startupMenuItem.Checked = verified; trayStartupItem.Checked = verified;
+                settings.StartWithWindows = verified; settings.Save();
+                status.Text = verified ? T("已验证：开机后将以最高权限常驻托盘。", "Verified: starts at logon with highest privileges in the tray.")
+                    : T("已验证：开机自启动已取消。", "Verified: startup task removed.");
+            }
             catch (Exception ex)
             {
-                DialogResult result = MessageBox.Show(T("恢复自动模式失败：", "Failed to restore Auto: ") + ex.Message + "\n" +
-                    T("仍要退出吗？后台看门狗还会再尝试一次。", "Exit anyway? The watchdog will try once more."), Text,
-                    MessageBoxButtons.YesNo, MessageBoxIcon.Error);
+                RefreshStartupState();
+                MessageBox.Show(T("开机启动设置失败。请确认程序以管理员身份运行。\n\n", "Startup setup failed. Verify that the app is running as administrator.\n\n") + ex.Message,
+                    Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void RequestExit()
+        {
+            allowExit = true;
+            ShowFromTray();
+            Close();
+        }
+
+        private void OnClosing(object sender, FormClosingEventArgs e)
+        {
+            if (!allowExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                HideToTray();
+                status.Text = T("已最小化到托盘；风扇控制继续运行。", "Minimized to tray; fan control remains active.");
+                return;
+            }
+            if (exiting) return;
+            exiting = true; timer.Stop();
+            try { if (firmware != null) firmware.SetBoth(FanState.Auto); }
+            catch (Exception ex) {
+                DialogResult result = MessageBox.Show(T("恢复 BIOS 自动失败：", "Failed to restore BIOS Auto: ") + ex.Message + "\n" +
+                    T("仍要退出吗？看门狗还会重试。", "Exit anyway? The watchdog will retry."), Text, MessageBoxButtons.YesNo, MessageBoxIcon.Error);
                 if (result == DialogResult.No) { e.Cancel = true; exiting = false; timer.Start(); return; }
             }
             tray.Visible = false; tray.Dispose(); if (transport != null) transport.Dispose();
-        }
-    }
-
-    internal static class StartupTask
-    {
-        private const string TaskName = "DellG15LegacyFanControl";
-        internal static void SetEnabled(bool enabled)
-        {
-            string tool = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "schtasks.exe");
-            string args = enabled
-                ? "/Create /F /SC ONLOGON /RL HIGHEST /TN \"" + TaskName + "\" /TR \"\\\"" + Application.ExecutablePath + "\\\" --startup\""
-                : "/Delete /F /TN \"" + TaskName + "\"";
-            ProcessStartInfo info = new ProcessStartInfo(tool, args); info.UseShellExecute = false; info.CreateNoWindow = true;
-            using (Process process = Process.Start(info))
-            {
-                if (!process.WaitForExit(10000) || process.ExitCode != 0)
-                    throw new InvalidOperationException("schtasks.exe failed.");
-            }
         }
     }
 }
