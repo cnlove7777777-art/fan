@@ -1,6 +1,6 @@
 # Dell G15 5515 True Fan Control
 
-A small bilingual Windows utility that gives the **Dell G15 5515** real firmware fan modes: **Auto, Off (0 RPM), Low, High, and a software curve**.
+A compact bilingual Windows utility that gives the **Dell G15 5515** three real manual firmware modes: **Off (0 RPM), Dell Low, and Dell High**, with a temperature-triggered BIOS Auto override.
 
 Unlike AWCC-style “fan boost” sliders, this project calls Dell's existing `LegacyDiags` WMI/SMM interface. On the validated machine, `Off` genuinely stops both internal fans and closing the program immediately restores BIOS automatic control.
 
@@ -9,14 +9,15 @@ Unlike AWCC-style “fan boost” sliders, this project calls Dell's existing `L
 ## Features
 
 - Real-time CPU temperature, NVIDIA GPU temperature, fan state and RPM
-- Firmware states: Auto / Off / Low / High
-- Configurable temperature curve using those four discrete states
+- Three manual firmware states: true 0 RPM / Dell Low / Dell High
+- Adjustable 60–100 °C threshold: BIOS Auto takes over only when CPU and GPU both reach it, then the selected manual state resumes after cooling
 - Chinese and English UI
-- Optional elevated Windows logon task and start-minimized mode
+- Verified highest-privilege Windows logon task; startup goes directly to the tray
 - Exact platform allowlist and `FEA3` `DIAG`/`DELL` signature validation
 - Compiled command allowlist—there is no arbitrary SMM/register console
-- Restores both fans to Auto on normal exit; a companion watchdog retries after an unexpected app exit
-- One 28 KB x64 executable; no custom kernel driver and no TESTSIGNING mode
+- The X button hides to the tray; the explicit Exit command restores both fans to Auto
+- A companion watchdog retries Auto after an unexpected app exit
+- One small x64 executable; no custom kernel driver and no TESTSIGNING mode
 
 ## Compatibility
 
@@ -37,21 +38,16 @@ The Dell WMI provider must already be present. It may be installed by Dell syste
 1. Download `DellG15FanControl.zip` from [Releases](https://github.com/cnlove7777777-art/fan/releases/latest).
 2. Verify `SHA256SUMS.txt` if desired, extract the ZIP, then run `DellG15FanControl.exe` as administrator.
 3. Windows may show a SmartScreen warning because the community build is not signed by a commercial code-signing certificate.
-4. Choose Auto, Off, Low, High, or enable Curve.
-5. Closing the window restores BIOS Auto. Minimizing sends the app to the tray.
+4. Choose 0 RPM, Dell Low, or Dell High and adjust the threshold slider (95 °C by default).
+5. The X button hides the controller in the tray. Use **Exit and restore BIOS Auto** from the three-dot or tray menu to end it.
 
-The startup checkbox creates a highest-privilege logon task named `DellG15LegacyFanControl`. It does not enable test mode and does not install a driver.
+The three-dot menu can create a highest-privilege logon task named `DellG15LegacyFanControl`. The app immediately reads the task back and verifies its enabled state, EXE path, `--startup` argument, logon trigger, and privilege level. It does not enable test mode or install a driver.
 
-## Curve behavior
+## Temperature override
 
-The curve controls firmware **states**, not arbitrary PWM/RPM values. Defaults:
+Dell Low and Dell High are firmware **states**, not arbitrary PWM or exact target-RPM values. Their observed RPM can differ between the two fans and with machine conditions; the displayed RPM is always read back from firmware.
 
-- up to 50 °C: Off
-- 51–65 °C: Low
-- 66–80 °C: High
-- above 80 °C: Auto (BIOS takes over)
-
-Writes occur only when the selected state changes. The displayed RPM is always read back from firmware.
+The default threshold is 95 °C. BIOS Auto temporarily takes over only when both the CPU and NVIDIA GPU meet the threshold. Once that condition is no longer true, the last selected manual state is restored. If GPU telemetry is unavailable, automatic threshold switching is not performed and the UI shows `N/A`.
 
 ## Build from source
 

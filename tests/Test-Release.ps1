@@ -17,6 +17,25 @@ foreach ($needle in $required) {
 if ($source -match 'WinRing|PawnIO|WriteProcessMemory|CreateFile\(') {
     throw 'An unexpected raw-driver or process-memory API appeared.'
 }
+$uiSource = [IO.File]::ReadAllText((Join-Path $root 'src\MainForm.cs'))
+foreach ($needle in @('FanState.Off','FanState.Low','FanState.High','value.CpuC >= threshold.Value','value.GpuC.Value >= threshold.Value')) {
+    if (-not $uiSource.Contains($needle)) { throw "Required compact-controller behavior missing: $needle" }
+}
+if ($uiSource -notmatch 'value\.CpuC >= threshold\.Value && value\.GpuC\.Value >= threshold\.Value') {
+    throw 'Thermal override must require CPU and GPU to reach the threshold together.'
+}
+$startupSource = [IO.File]::ReadAllText((Join-Path $root 'src\StartupTask.cs'))
+$programSource = [IO.File]::ReadAllText((Join-Path $root 'src\Program.cs'))
+foreach ($needle in @('e.CloseReason == CloseReason.UserClosing','HideToTray();','RequestExit()','StartupTask.VerifyExact')) {
+    if (-not $uiSource.Contains($needle)) { throw "Tray/startup behavior missing: $needle" }
+}
+if (-not $startupSource.Contains('--startup')) { throw 'Startup argument is missing.' }
+foreach ($needle in @('--enable-startup','--disable-startup')) {
+    if (-not $programSource.Contains($needle)) { throw "Startup integration command missing: $needle" }
+}
+foreach ($needle in @('HighestAvailable','LogonTrigger','Application.ExecutablePath','startup argument does not match','EXE path does not match')) {
+    if (-not $startupSource.Contains($needle)) { throw "Startup verification contract missing: $needle" }
+}
 
 $manifest = [xml][IO.File]::ReadAllText((Join-Path $root 'app.manifest'))
 $level = $manifest.assembly.trustInfo.security.requestedPrivileges.requestedExecutionLevel.level

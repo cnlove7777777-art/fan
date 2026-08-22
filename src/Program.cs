@@ -16,6 +16,17 @@ namespace DellG15FanControl
         [STAThread]
         private static void Main(string[] args)
         {
+            if (args.Length == 1 && (args[0] == "--enable-startup" || args[0] == "--disable-startup"))
+            {
+                try
+                {
+                    StartupTask.SetEnabled(args[0] == "--enable-startup");
+                    Environment.ExitCode = 0;
+                }
+                catch { Environment.ExitCode = 10; }
+                return;
+            }
+
             if (args.Length >= 2 && args[0] == "--watchdog")
             {
                 int pid;
@@ -75,7 +86,7 @@ namespace DellG15FanControl
             try
             {
                 PlatformPolicy.DemandExactMatch();
-                using (LegacyDiagsTransport transport = LegacyDiagsTransport.Connect())
+                using (IDiagsTransport transport = PowerShellCimTransport.Connect())
                 {
                     FanFirmware firmware = new FanFirmware(transport);
                     firmware.VerifyRevision();

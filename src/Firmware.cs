@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Management;
+using System.Diagnostics;
+using System.Text;
+using System.Threading.Tasks;
 using Microsoft.Win32;
 
 namespace DellG15FanControl
@@ -30,6 +33,11 @@ namespace DellG15FanControl
         internal uint Eax, Ebx, Ecx, Edx;
     }
 
+    internal interface IDiagsTransport : IDisposable
+    {
+        Registers Execute(uint eax, uint ebx, uint ecx, uint edx);
+    }
+
     internal static class PlatformPolicy
     {
         internal const string Manufacturer = "Dell Inc.";
@@ -53,7 +61,7 @@ namespace DellG15FanControl
         }
     }
 
-    internal sealed class LegacyDiagsTransport : IDisposable
+    internal sealed class LegacyDiagsTransport : IDiagsTransport
     {
         private const string NamespacePath = @"\\.\root\dcim\sysman\diagnostics";
         private static readonly HashSet<uint> Allowed = new HashSet<uint>(new uint[] {
@@ -82,10 +90,7 @@ namespace DellG15FanControl
                         if (!(active is bool) || !(bool)active) continue;
                         count++;
                         if (selected == null)
-                        {
-                            selected = new ManagementObject(scope, new ManagementPath(item.Path.Path), null);
-                            selected.Get();
-                        }
+                            selected = (ManagementObject)item.Clone();
                     }
                     finally { item.Dispose(); }
                 }
@@ -98,7 +103,7 @@ namespace DellG15FanControl
             return new LegacyDiagsTransport(selected);
         }
 
-        internal Registers Execute(uint eax, uint ebx, uint ecx, uint edx)
+        public Registers Execute(uint eax, uint ebx, uint ecx, uint edx)
         {
             if (!Allowed.Contains(eax)) throw new InvalidOperationException("Command is not allowlisted.");
             lock (gate)
@@ -138,11 +143,107 @@ namespace DellG15FanControl
         public void Dispose() { if (instance != null) { instance.Dispose(); instance = null; } }
     }
 
+    internal sealed class PowerShellCimTransport : IDiagsTransport
+    {
+        private readonly object gate = new object();
+        private Process process;
+
+        private PowerShellCimTransport(Process value) { process = value; }
+
+        internal static PowerShellCimTransport Connect()
+        {
+            string script = @"
+$ErrorActionPreference='Stop'
+function Encode-Error([string]$text) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text)) }
+function Put-Reg($table,[string]$name,[uint32]$value) { $table[$name+'Len']=[uint32]4; $table[$name+'Val']=[BitConverter]::GetBytes($value) }
+function Get-Reg($value,[string]$name) { $bytes=[byte[]]$value.($name+'Val'); if([uint32]$value.($name+'Len') -ne 4 -or $bytes.Length -ne 4){throw 'Invalid '+$name}; [BitConverter]::ToUInt32($bytes,0) }
+try {
+  $items=@(Get-CimInstance -Namespace 'root/dcim/sysman/diagnostics' -ClassName LegacyDiags | Where-Object { $_.Active })
+  if($items.Count -ne 1){throw 'Expected exactly one active LegacyDiags instance; found '+$items.Count}
+  $instance=$items[0]
+  [Console]::Out.WriteLine('READY'); [Console]::Out.Flush()
+  while(($line=[Console]::In.ReadLine()) -ne $null) {
+    if($line -eq 'QUIT'){break}
+    try {
+      $p=$line.Split('|'); if($p.Length -ne 4){throw 'Invalid request'}
+      $a=@{}; Put-Reg $a 'Eax' ([Convert]::ToUInt32($p[0],16)); Put-Reg $a 'Ebx' ([Convert]::ToUInt32($p[1],16)); Put-Reg $a 'Ecx' ([Convert]::ToUInt32($p[2],16)); Put-Reg $a 'Edx' ([Convert]::ToUInt32($p[3],16))
+      $r=Invoke-CimMethod -InputObject $instance -MethodName Execute -Arguments $a
+      if(-not [bool]$r.ReturnValue){throw 'LegacyDiags.Execute returned false'}
+      [Console]::Out.WriteLine(('OK|{0:X8}|{1:X8}|{2:X8}|{3:X8}' -f (Get-Reg $r 'Eax'),(Get-Reg $r 'Ebx'),(Get-Reg $r 'Ecx'),(Get-Reg $r 'Edx'))); [Console]::Out.Flush()
+    } catch { [Console]::Out.WriteLine('ERR|'+(Encode-Error ($_.Exception.GetType().Name+': '+$_.Exception.Message))); [Console]::Out.Flush() }
+  }
+} catch { [Console]::Out.WriteLine('FATAL|'+(Encode-Error ($_.Exception.GetType().Name+': '+$_.Exception.Message))); [Console]::Out.Flush() }
+";
+            string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+            string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
+                @"WindowsPowerShell\v1.0\powershell.exe");
+            ProcessStartInfo info = new ProcessStartInfo(exe,
+                "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + encoded);
+            info.UseShellExecute = false; info.CreateNoWindow = true;
+            info.RedirectStandardInput = true; info.RedirectStandardOutput = true; info.RedirectStandardError = true;
+            Process child = Process.Start(info);
+            if (child == null) throw new InvalidOperationException("CIM worker did not start.");
+            PowerShellCimTransport transport = new PowerShellCimTransport(child);
+            string ready = transport.ReadLine(12);
+            if (ready == "READY") return transport;
+            transport.Dispose();
+            throw new InvalidOperationException("Dell CIM worker startup failed: " + DecodeErrorLine(ready));
+        }
+
+        public Registers Execute(uint eax, uint ebx, uint ecx, uint edx)
+        {
+            lock (gate)
+            {
+                if (process == null || process.HasExited) throw new InvalidOperationException("Dell CIM worker is not running.");
+                process.StandardInput.WriteLine("{0:X8}|{1:X8}|{2:X8}|{3:X8}", eax, ebx, ecx, edx);
+                process.StandardInput.Flush();
+                string line = ReadLine(8);
+                string[] parts = line == null ? new string[0] : line.Split('|');
+                if (parts.Length == 5 && parts[0] == "OK")
+                    return new Registers { Eax = UInt32.Parse(parts[1], NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                        Ebx = UInt32.Parse(parts[2], NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                        Ecx = UInt32.Parse(parts[3], NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+                        Edx = UInt32.Parse(parts[4], NumberStyles.HexNumber, CultureInfo.InvariantCulture) };
+                throw new InvalidOperationException("Dell CIM call failed: " + DecodeErrorLine(line));
+            }
+        }
+
+        private string ReadLine(int seconds)
+        {
+            Task<string> read = process.StandardOutput.ReadLineAsync();
+            if (!read.Wait(TimeSpan.FromSeconds(seconds)))
+            {
+                try { process.Kill(); } catch { }
+                throw new TimeoutException("Dell CIM worker timed out.");
+            }
+            return read.Result;
+        }
+
+        private static string DecodeErrorLine(string line)
+        {
+            if (String.IsNullOrEmpty(line)) return "no response";
+            int split = line.IndexOf('|');
+            if (split < 0) return line;
+            try { return Encoding.UTF8.GetString(Convert.FromBase64String(line.Substring(split + 1))); }
+            catch { return line; }
+        }
+
+        public void Dispose()
+        {
+            lock (gate)
+            {
+                if (process == null) return;
+                try { if (!process.HasExited) { process.StandardInput.WriteLine("QUIT"); process.StandardInput.Flush(); if (!process.WaitForExit(1500)) process.Kill(); } } catch { }
+                process.Dispose(); process = null;
+            }
+        }
+    }
+
     internal sealed class FanFirmware
     {
-        private readonly LegacyDiagsTransport transport;
+        private readonly IDiagsTransport transport;
         private bool verified;
-        internal FanFirmware(LegacyDiagsTransport value) { transport = value; }
+        internal FanFirmware(IDiagsTransport value) { transport = value; }
 
         internal int VerifyRevision()
         {
