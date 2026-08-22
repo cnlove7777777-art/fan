@@ -17,13 +17,21 @@ foreach ($needle in $required) {
 if ($source -match 'WinRing|PawnIO|WriteProcessMemory|CreateFile\(') {
     throw 'An unexpected raw-driver or process-memory API appeared.'
 }
+
 $uiSource = [IO.File]::ReadAllText((Join-Path $root 'src\MainForm.cs'))
-foreach ($needle in @('FanState.Off','FanState.Low','FanState.High','int limit = emergencyThreshold','value.CpuC >= limit','value.GpuC.Value >= limit')) {
+foreach ($needle in @('FanState.Off','FanState.Low','FanState.High')) {
     if (-not $uiSource.Contains($needle)) { throw "Required compact-controller behavior missing: $needle" }
 }
-if ($uiSource -notmatch 'value\.CpuC >= limit && value\.GpuC\.Value >= limit') {
-    throw 'Thermal override must require CPU and GPU to reach the cached threshold together.'
+
+# Verify the thermal override structurally instead of depending on a specific local
+# variable name (for example threshold.Value vs a cached `limit` field/value).
+# CPU and GPU must both be present in the same AND expression and compare against
+# the same threshold identifier.
+$thermalPattern = 'return\s+value\s*!=\s*null\s*&&\s*value\.GpuC\.HasValue\s*&&\s*value\.CpuC\s*>=\s*(?<threshold>[A-Za-z_][A-Za-z0-9_]*)\s*&&\s*value\.GpuC\.Value\s*>=\s*\k<threshold>\s*;'
+if ($uiSource -notmatch $thermalPattern) {
+    throw 'Thermal override must require CPU and GPU to reach the same cached threshold together.'
 }
+
 $startupSource = [IO.File]::ReadAllText((Join-Path $root 'src\StartupTask.cs'))
 $programSource = [IO.File]::ReadAllText((Join-Path $root 'src\Program.cs'))
 foreach ($needle in @('e.CloseReason == CloseReason.UserClosing','HideToTray();','RequestExit()','StartupTask.VerifyExact')) {
