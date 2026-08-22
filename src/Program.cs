@@ -12,6 +12,7 @@ namespace DellG15FanControl
     internal static class Program
     {
         private const string MutexName = "Global\\DellG15LegacyFanControl-5515";
+        private static EventWaitHandle watchdogSkipRestore;
 
         [STAThread]
         private static void Main(string[] args)
@@ -27,11 +28,11 @@ namespace DellG15FanControl
                 return;
             }
 
-            if (args.Length >= 2 && args[0] == "--watchdog")
+            if (args.Length >= 3 && args[0] == "--watchdog")
             {
                 int pid;
                 if (Int32.TryParse(args[1], NumberStyles.None, CultureInfo.InvariantCulture, out pid))
-                    RunWatchdog(pid);
+                    RunWatchdog(pid, args[2]);
                 return;
             }
 
@@ -62,9 +63,13 @@ namespace DellG15FanControl
         {
             using (Process current = Process.GetCurrentProcess())
             {
+                string eventName = "Local\\DellG15FanControl-WatchdogSkip-" + current.Id.ToString(CultureInfo.InvariantCulture);
+                if (watchdogSkipRestore != null) watchdogSkipRestore.Dispose();
+                watchdogSkipRestore = new EventWaitHandle(false, EventResetMode.ManualReset, eventName);
+
                 ProcessStartInfo info = new ProcessStartInfo();
                 info.FileName = Application.ExecutablePath;
-                info.Arguments = "--watchdog " + current.Id.ToString(CultureInfo.InvariantCulture);
+                info.Arguments = "--watchdog " + current.Id.ToString(CultureInfo.InvariantCulture) + " " + eventName;
                 info.UseShellExecute = false;
                 info.CreateNoWindow = true;
                 info.WindowStyle = ProcessWindowStyle.Hidden;
@@ -72,29 +77,48 @@ namespace DellG15FanControl
             }
         }
 
-        private static void RunWatchdog(int parentPid)
+        internal static void SuppressWatchdogRestore()
         {
-            try
-            {
-                Process parent = Process.GetProcessById(parentPid);
-                parent.WaitForExit();
-            }
-            catch
-            {
-            }
+            try { if (watchdogSkipRestore != null) watchdogSkipRestore.Set(); }
+            catch { }
+        }
+
+        private static void RunWatchdog(int parentPid, string skipEventName)
+        {
+            EventWaitHandle skip = null;
+            try { skip = EventWaitHandle.OpenExisting(skipEventName); }
+            catch { }
 
             try
             {
-                PlatformPolicy.DemandExactMatch();
-                using (IDiagsTransport transport = PowerShellCimTransport.Connect())
+                try
                 {
-                    FanFirmware firmware = new FanFirmware(transport);
-                    firmware.VerifyRevision();
-                    firmware.SetBoth(FanState.Auto);
+                    Process parent = Process.GetProcessById(parentPid);
+                    parent.WaitForExit();
+                }
+                catch
+                {
+                }
+
+                if (skip != null && skip.WaitOne(0)) return;
+
+                try
+                {
+                    PlatformPolicy.DemandExactMatch();
+                    using (IDiagsTransport transport = PowerShellCimTransport.Connect())
+                    {
+                        FanFirmware firmware = new FanFirmware(transport);
+                        firmware.VerifyRevision();
+                        firmware.SetBoth(FanState.Auto);
+                    }
+                }
+                catch
+                {
                 }
             }
-            catch
+            finally
             {
+                if (skip != null) skip.Dispose();
             }
         }
     }

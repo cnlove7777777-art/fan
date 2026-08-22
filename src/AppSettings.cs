@@ -13,6 +13,7 @@ namespace DellG15FanControl
         internal bool StartWithWindows;
         internal bool StartMinimized;
         internal int EmergencyThreshold = 95;
+        internal int LastManualState = -1;
 
         private static string FilePath
         {
@@ -37,6 +38,7 @@ namespace DellG15FanControl
                     else if (pair[0] == "StartWithWindows" && Boolean.TryParse(pair[1], out b)) settings.StartWithWindows = b;
                     else if (pair[0] == "StartMinimized" && Boolean.TryParse(pair[1], out b)) settings.StartMinimized = b;
                     else if (pair[0] == "EmergencyThreshold" && Int32.TryParse(pair[1], out n)) settings.EmergencyThreshold = n;
+                    else if (pair[0] == "LastManualState" && Int32.TryParse(pair[1], out n)) settings.LastManualState = n;
                 }
             }
             catch { }
@@ -56,7 +58,8 @@ namespace DellG15FanControl
                 "HighMax=" + HighMax.ToString(CultureInfo.InvariantCulture),
                 "StartWithWindows=" + StartWithWindows.ToString(CultureInfo.InvariantCulture),
                 "StartMinimized=" + StartMinimized.ToString(CultureInfo.InvariantCulture),
-                "EmergencyThreshold=" + EmergencyThreshold.ToString(CultureInfo.InvariantCulture)
+                "EmergencyThreshold=" + EmergencyThreshold.ToString(CultureInfo.InvariantCulture),
+                "LastManualState=" + LastManualState.ToString(CultureInfo.InvariantCulture)
             });
         }
 
@@ -66,6 +69,7 @@ namespace DellG15FanControl
             if (LowMax <= OffMax || LowMax > 85) LowMax = Math.Max(OffMax + 5, 65);
             if (HighMax <= LowMax || HighMax > 95) HighMax = Math.Max(LowMax + 5, 80);
             if (EmergencyThreshold < 60 || EmergencyThreshold > 100) EmergencyThreshold = 95;
+            if (LastManualState < -1 || LastManualState > 2) LastManualState = -1;
         }
     }
 }
