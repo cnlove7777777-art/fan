@@ -26,5 +26,17 @@ $hashLine = [IO.File]::ReadAllText((Join-Path $root 'dist\SHA256SUMS.txt')).Trim
 $actual = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
 if (-not $hashLine.StartsWith($actual, [StringComparison]::OrdinalIgnoreCase)) { throw 'SHA256 manifest mismatch.' }
 
+$compiler = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+$smoke = Join-Path ([IO.Path]::GetTempPath()) ('DellG15FanUiSmoke-' + [Guid]::NewGuid().ToString('N') + '.exe')
+try {
+    & $compiler /nologo /target:exe /platform:x64 /out:"$smoke" /reference:System.dll /reference:System.Windows.Forms.dll (Join-Path $PSScriptRoot 'UiSmoke.cs')
+    if ($LASTEXITCODE -ne 0) { throw 'UI smoke harness compilation failed.' }
+    & $smoke $exe
+    if ($LASTEXITCODE -ne 0) { throw "UI smoke test failed with exit code $LASTEXITCODE" }
+}
+finally {
+    if (Test-Path -LiteralPath $smoke) { [IO.File]::Delete($smoke) }
+}
+
 Write-Host 'Release checks: PASS'
 Write-Host "SHA256: $actual"
