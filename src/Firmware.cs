@@ -184,10 +184,17 @@ try {
             Process child = Process.Start(info);
             if (child == null) throw new InvalidOperationException("CIM worker did not start.");
             PowerShellCimTransport transport = new PowerShellCimTransport(child);
-            string ready = transport.ReadLine(12);
-            if (ready == "READY") return transport;
-            transport.Dispose();
-            throw new InvalidOperationException("Dell CIM worker startup failed: " + DecodeErrorLine(ready));
+            try
+            {
+                string ready = transport.ReadLine(12);
+                if (ready == "READY") return transport;
+                throw new InvalidOperationException("Dell CIM worker startup failed: " + DecodeErrorLine(ready));
+            }
+            catch
+            {
+                transport.Dispose();
+                throw;
+            }
         }
 
         public Registers Execute(uint eax, uint ebx, uint ecx, uint edx)
