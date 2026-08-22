@@ -18,6 +18,7 @@ namespace DellG15FanControl
         private bool thermalOverride;
         private FanState? selectedManualState;
         private Telemetry lastTelemetry;
+        private volatile int emergencyThreshold;
         private Label cpu, gpu, fan0, fan1, status, thresholdText;
         private Button offButton, lowButton, highButton;
         private TrackBar threshold;
@@ -31,6 +32,7 @@ namespace DellG15FanControl
         internal MainForm(bool launchedMinimized)
         {
             settings = AppSettings.Load();
+            emergencyThreshold = settings.EmergencyThreshold;
             InitializeUi();
             ApplyLanguage();
             timer = new System.Windows.Forms.Timer();
@@ -103,8 +105,13 @@ namespace DellG15FanControl
             controls.Controls.Add(offButton, 0, 0); controls.Controls.Add(lowButton, 1, 0); controls.Controls.Add(highButton, 2, 0);
             threshold = new TrackBar(); threshold.Dock = DockStyle.Fill;
             threshold.Minimum = 60; threshold.Maximum = 100; threshold.TickFrequency = 5;
-            threshold.SmallChange = 1; threshold.LargeChange = 5; threshold.Value = settings.EmergencyThreshold;
-            threshold.ValueChanged += delegate { settings.EmergencyThreshold = threshold.Value; settings.Save(); UpdateThresholdText(); };
+            threshold.SmallChange = 1; threshold.LargeChange = 5; threshold.Value = emergencyThreshold;
+            threshold.ValueChanged += delegate {
+                emergencyThreshold = threshold.Value;
+                settings.EmergencyThreshold = emergencyThreshold;
+                settings.Save();
+                UpdateThresholdText();
+            };
             controls.Controls.Add(threshold, 3, 0);
             language = new ComboBox(); language.Dock = DockStyle.Fill; language.DropDownStyle = ComboBoxStyle.DropDownList;
             language.Items.AddRange(new object[] { "中", "EN" }); language.SelectedIndex = settings.Language == "en-US" ? 1 : 0;
@@ -156,7 +163,7 @@ namespace DellG15FanControl
         private void UpdateThresholdText()
         {
             thresholdText.Text = T("CPU 与 GPU 同时达到 ", "BIOS Auto when both CPU and GPU reach ") +
-                threshold.Value.ToString(CultureInfo.InvariantCulture) + T(" °C：BIOS 临时接管；降温后恢复所选档",
+                emergencyThreshold.ToString(CultureInfo.InvariantCulture) + T(" °C：BIOS 临时接管；降温后恢复所选档",
                 " °C; selected mode resumes after cooling");
         }
 
@@ -164,7 +171,8 @@ namespace DellG15FanControl
         {
             SetButtons(false);
             ThreadPool.QueueUserWorkItem(delegate {
-                try {
+                try
+                {
                     PlatformPolicy.DemandExactMatch();
                     transport = PowerShellCimTransport.Connect();
                     firmware = new FanFirmware(transport); firmware.VerifyRevision();
@@ -180,7 +188,8 @@ namespace DellG15FanControl
         {
             if (firmware == null || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
             ThreadPool.QueueUserWorkItem(delegate {
-                try {
+                try
+                {
                     Telemetry value = firmware.ReadTelemetry(); lastTelemetry = value;
                     ApplyThermalOverride(value); BeginInvoke(new Action(delegate { Display(value); }));
                 } catch (Exception ex) { if (!exiting) BeginInvoke(new Action(delegate { status.Text = T("刷新失败：", "Refresh failed: ") + ex.Message; })); }
@@ -210,13 +219,19 @@ namespace DellG15FanControl
         private void SelectManualState(FanState state)
         {
             if (firmware == null || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
-            selectedManualState = state; SetSelectedButton(state); SetButtons(false);
+            SetButtons(false);
             ThreadPool.QueueUserWorkItem(delegate {
-                try {
-                    bool hot = IsBothHot(lastTelemetry); firmware.SetBoth(hot ? FanState.Auto : state); thermalOverride = hot;
+                try
+                {
+                    bool hot = IsBothHot(lastTelemetry);
+                    firmware.SetBoth(hot ? FanState.Auto : state);
+                    selectedManualState = state;
+                    thermalOverride = hot;
                     BeginInvoke(new Action(delegate {
+                        SetSelectedButton(state);
                         status.Text = hot ? T("已记住所选档；当前由 BIOS 自动接管。", "Mode saved; BIOS Auto is active while both sensors are hot.")
-                            : T("已切换到：", "Applied: ") + StateName(state); SetButtons(true);
+                            : T("已切换到：", "Applied: ") + StateName(state);
+                        SetButtons(true);
                     }));
                 } catch (Exception ex) { BeginInvoke(new Action(delegate { status.Text = T("切换失败：", "Switch failed: ") + ex.Message; SetButtons(true); })); }
                 finally { Interlocked.Exchange(ref busy, 0); }
@@ -233,7 +248,8 @@ namespace DellG15FanControl
 
         private bool IsBothHot(Telemetry value)
         {
-            return value != null && value.GpuC.HasValue && value.CpuC >= threshold.Value && value.GpuC.Value >= threshold.Value;
+            int limit = emergencyThreshold;
+            return value != null && value.GpuC.HasValue && value.CpuC >= limit && value.GpuC.Value >= limit;
         }
 
         private void SetSelectedButton(FanState state)
