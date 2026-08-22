@@ -196,8 +196,8 @@ namespace DellG15FanControl
         {
             if (exiting || systemEnding || IsDisposed || Disposing || !IsHandleCreated) return;
             try { BeginInvoke(action); }
-            catch (InvalidOperationException) { }
             catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
         }
 
         private void ConnectAsync()
