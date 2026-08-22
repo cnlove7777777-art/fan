@@ -1,0 +1,6 @@
+obj/
+*.pdb
+*.user
+*.suo
+*.zip
+dist/*.zip
