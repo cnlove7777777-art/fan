@@ -18,11 +18,11 @@ if ($source -match 'WinRing|PawnIO|WriteProcessMemory|CreateFile\(') {
     throw 'An unexpected raw-driver or process-memory API appeared.'
 }
 $uiSource = [IO.File]::ReadAllText((Join-Path $root 'src\MainForm.cs'))
-foreach ($needle in @('FanState.Off','FanState.Low','FanState.High','value.CpuC >= threshold.Value','value.GpuC.Value >= threshold.Value')) {
+foreach ($needle in @('FanState.Off','FanState.Low','FanState.High','int limit = emergencyThreshold','value.CpuC >= limit','value.GpuC.Value >= limit')) {
     if (-not $uiSource.Contains($needle)) { throw "Required compact-controller behavior missing: $needle" }
 }
-if ($uiSource -notmatch 'value\.CpuC >= threshold\.Value && value\.GpuC\.Value >= threshold\.Value') {
-    throw 'Thermal override must require CPU and GPU to reach the threshold together.'
+if ($uiSource -notmatch 'value\.CpuC >= limit && value\.GpuC\.Value >= limit') {
+    throw 'Thermal override must require CPU and GPU to reach the cached threshold together.'
 }
 $startupSource = [IO.File]::ReadAllText((Join-Path $root 'src\StartupTask.cs'))
 $programSource = [IO.File]::ReadAllText((Join-Path $root 'src\Program.cs'))
