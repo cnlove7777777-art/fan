@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Globalization;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace DellG15FanControl
 {
@@ -11,10 +12,12 @@ namespace DellG15FanControl
         private readonly AppSettings settings;
         private readonly System.Windows.Forms.Timer timer;
         private readonly NotifyIcon tray;
+        private readonly bool launchedFromStartup;
         private IDiagsTransport transport;
         private FanFirmware firmware;
         private int busy;
-        private bool exiting;
+        private volatile bool exiting;
+        private volatile bool systemEnding;
         private bool thermalOverride;
         private FanState? selectedManualState;
         private Telemetry lastTelemetry;
@@ -31,6 +34,7 @@ namespace DellG15FanControl
 
         internal MainForm(bool launchedMinimized)
         {
+            launchedFromStartup = launchedMinimized;
             settings = AppSettings.Load();
             emergencyThreshold = settings.EmergencyThreshold;
             InitializeUi();
@@ -49,13 +53,14 @@ namespace DellG15FanControl
                 trayStartupItem,
                 new MenuItem("Exit / 退出", delegate { RequestExit(); }) });
             Shown += delegate {
-                ConnectAsync();
                 try { Program.StartWatchdog(); } catch { }
                 RefreshStartupState();
                 if (launchedMinimized) BeginInvoke(new Action(HideToTray));
+                ConnectAsync();
             };
             Resize += delegate { if (WindowState == FormWindowState.Minimized) HideToTray(); };
             FormClosing += OnClosing;
+            SystemEvents.SessionEnding += OnSessionEnding;
         }
 
         private void InitializeUi()
@@ -167,32 +172,124 @@ namespace DellG15FanControl
                 " °C; selected mode resumes after cooling");
         }
 
+        private FanState? SavedManualState()
+        {
+            return settings.LastManualState >= 0 && settings.LastManualState <= 2
+                ? (FanState?)((FanState)settings.LastManualState) : null;
+        }
+
+        private bool WaitWhileRunning(int milliseconds)
+        {
+            int remaining = milliseconds;
+            while (remaining > 0)
+            {
+                if (exiting || systemEnding) return false;
+                int slice = Math.Min(250, remaining);
+                Thread.Sleep(slice);
+                remaining -= slice;
+            }
+            return !exiting && !systemEnding;
+        }
+
+        private void PostToUi(Action action)
+        {
+            if (exiting || systemEnding || IsDisposed || Disposing || !IsHandleCreated) return;
+            try { BeginInvoke(action); }
+            catch (InvalidOperationException) { }
+            catch (ObjectDisposedException) { }
+        }
+
         private void ConnectAsync()
         {
             SetButtons(false);
             ThreadPool.QueueUserWorkItem(delegate {
-                try
+                Exception lastError = null;
+                int attempts = launchedFromStartup ? 4 : 2;
+
+                if (launchedFromStartup && !WaitWhileRunning(10000)) return;
+
+                for (int attempt = 1; attempt <= attempts && !exiting && !systemEnding; attempt++)
                 {
-                    PlatformPolicy.DemandExactMatch();
-                    transport = PowerShellCimTransport.Connect();
-                    firmware = new FanFirmware(transport); firmware.VerifyRevision();
-                    BeginInvoke(new Action(delegate {
-                        status.Text = T("已连接；请选择手动档位。", "Connected; select a manual mode.");
-                        SetButtons(true); timer.Start(); RefreshAsync();
-                    }));
-                } catch (Exception ex) { BeginInvoke(new Action(delegate { status.Text = T("连接失败：", "Connection failed: ") + ex.Message; })); }
+                    IDiagsTransport candidate = null;
+                    try
+                    {
+                        PlatformPolicy.DemandExactMatch();
+                        candidate = PowerShellCimTransport.Connect();
+                        FanFirmware candidateFirmware = new FanFirmware(candidate);
+                        candidateFirmware.VerifyRevision();
+
+                        Telemetry initial = candidateFirmware.ReadTelemetry();
+                        FanState? restoreState = SavedManualState();
+                        bool hot = restoreState.HasValue && IsBothHot(initial);
+                        if (restoreState.HasValue)
+                        {
+                            candidateFirmware.SetBoth(hot ? FanState.Auto : restoreState.Value);
+                            initial = candidateFirmware.ReadTelemetry();
+                        }
+
+                        if (exiting || systemEnding)
+                        {
+                            if (!systemEnding) candidate.Dispose();
+                            return;
+                        }
+
+                        transport = candidate;
+                        firmware = candidateFirmware;
+                        candidate = null;
+                        lastTelemetry = initial;
+                        selectedManualState = restoreState;
+                        thermalOverride = hot;
+
+                        PostToUi(delegate {
+                            if (restoreState.HasValue) SetSelectedButton(restoreState.Value);
+                            Display(initial);
+                            if (restoreState.HasValue)
+                                status.Text = hot
+                                    ? T("已恢复上次档位：", "Restored saved mode: ") + StateName(restoreState.Value) + T("；当前由 BIOS 自动接管。", "; BIOS Auto is active while hot.")
+                                    : T("已恢复上次档位：", "Restored saved mode: ") + StateName(restoreState.Value);
+                            else
+                                status.Text = T("已连接；请选择手动档位。", "Connected; select a manual mode.");
+                            SetButtons(true);
+                            timer.Start();
+                            RefreshAsync();
+                        });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        lastError = ex;
+                        try { if (candidate != null) candidate.Dispose(); } catch { }
+                        if (attempt < attempts && !exiting && !systemEnding)
+                        {
+                            int shownAttempt = attempt + 1;
+                            PostToUi(delegate {
+                                status.Text = T("Dell CIM 尚未就绪，正在重试（", "Dell CIM is not ready; retrying (") +
+                                    shownAttempt.ToString(CultureInfo.InvariantCulture) + "/" + attempts.ToString(CultureInfo.InvariantCulture) + ")…";
+                            });
+                            if (!WaitWhileRunning(5000)) return;
+                        }
+                    }
+                }
+
+                if (lastError != null && !exiting && !systemEnding)
+                    PostToUi(delegate { status.Text = T("连接失败：", "Connection failed: ") + lastError.Message; });
             });
         }
 
         private void RefreshAsync()
         {
-            if (firmware == null || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
+            if (firmware == null || exiting || systemEnding || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
             ThreadPool.QueueUserWorkItem(delegate {
                 try
                 {
                     Telemetry value = firmware.ReadTelemetry(); lastTelemetry = value;
-                    ApplyThermalOverride(value); BeginInvoke(new Action(delegate { Display(value); }));
-                } catch (Exception ex) { if (!exiting) BeginInvoke(new Action(delegate { status.Text = T("刷新失败：", "Refresh failed: ") + ex.Message; })); }
+                    ApplyThermalOverride(value); PostToUi(delegate { Display(value); });
+                }
+                catch (Exception ex)
+                {
+                    if (!exiting && !systemEnding)
+                        PostToUi(delegate { status.Text = T("刷新失败：", "Refresh failed: ") + ex.Message; });
+                }
                 finally { Interlocked.Exchange(ref busy, 0); }
             });
         }
@@ -218,7 +315,7 @@ namespace DellG15FanControl
 
         private void SelectManualState(FanState state)
         {
-            if (firmware == null || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
+            if (firmware == null || exiting || systemEnding || Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
             SetButtons(false);
             ThreadPool.QueueUserWorkItem(delegate {
                 try
@@ -227,20 +324,26 @@ namespace DellG15FanControl
                     firmware.SetBoth(hot ? FanState.Auto : state);
                     selectedManualState = state;
                     thermalOverride = hot;
-                    BeginInvoke(new Action(delegate {
+                    PostToUi(delegate {
+                        settings.LastManualState = (int)state;
+                        settings.Save();
                         SetSelectedButton(state);
                         status.Text = hot ? T("已记住所选档；当前由 BIOS 自动接管。", "Mode saved; BIOS Auto is active while both sensors are hot.")
-                            : T("已切换到：", "Applied: ") + StateName(state);
+                            : T("已切换并记住：", "Applied and saved: ") + StateName(state);
                         SetButtons(true);
-                    }));
-                } catch (Exception ex) { BeginInvoke(new Action(delegate { status.Text = T("切换失败：", "Switch failed: ") + ex.Message; SetButtons(true); })); }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    PostToUi(delegate { status.Text = T("切换失败：", "Switch failed: ") + ex.Message; SetButtons(true); });
+                }
                 finally { Interlocked.Exchange(ref busy, 0); }
             });
         }
 
         private void ApplyThermalOverride(Telemetry value)
         {
-            if (!selectedManualState.HasValue || !value.GpuC.HasValue) return;
+            if (!selectedManualState.HasValue || !value.GpuC.HasValue || exiting || systemEnding) return;
             bool hot = IsBothHot(value);
             if (hot && !thermalOverride) { firmware.SetBoth(FanState.Auto); thermalOverride = true; }
             else if (!hot && thermalOverride) { firmware.SetBoth(selectedManualState.Value); thermalOverride = false; }
@@ -302,24 +405,60 @@ namespace DellG15FanControl
             Close();
         }
 
+        private void OnSessionEnding(object sender, SessionEndingEventArgs e)
+        {
+            systemEnding = true;
+            Program.SuppressWatchdogRestore();
+        }
+
         private void OnClosing(object sender, FormClosingEventArgs e)
         {
-            if (!allowExit && e.CloseReason == CloseReason.UserClosing)
+            bool windowsShutdown = systemEnding || e.CloseReason == CloseReason.WindowsShutDown;
+            if (!allowExit && !windowsShutdown && e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
                 HideToTray();
                 status.Text = T("已最小化到托盘；风扇控制继续运行。", "Minimized to tray; fan control remains active.");
                 return;
             }
+
+            if (windowsShutdown)
+            {
+                systemEnding = true;
+                exiting = true;
+                Program.SuppressWatchdogRestore();
+                try { timer.Stop(); } catch { }
+                try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { }
+                try { tray.Visible = false; tray.Dispose(); } catch { }
+                PowerShellCimTransport cim = transport as PowerShellCimTransport;
+                if (cim != null) cim.Abort();
+                return;
+            }
+
             if (exiting) return;
-            exiting = true; timer.Stop();
+            exiting = true;
+            timer.Stop();
+            bool restored = true;
             try { if (firmware != null) firmware.SetBoth(FanState.Auto); }
-            catch (Exception ex) {
+            catch (Exception ex)
+            {
+                restored = false;
                 DialogResult result = MessageBox.Show(T("恢复 BIOS 自动失败：", "Failed to restore BIOS Auto: ") + ex.Message + "\n" +
                     T("仍要退出吗？看门狗还会重试。", "Exit anyway? The watchdog will retry."), Text, MessageBoxButtons.YesNo, MessageBoxIcon.Error);
-                if (result == DialogResult.No) { e.Cancel = true; exiting = false; timer.Start(); return; }
+                if (result == DialogResult.No)
+                {
+                    e.Cancel = true;
+                    exiting = false;
+                    timer.Start();
+                    return;
+                }
             }
-            tray.Visible = false; tray.Dispose(); if (transport != null) transport.Dispose();
+
+            if (restored) Program.SuppressWatchdogRestore();
+            try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { }
+            tray.Visible = false;
+            tray.Dispose();
+            if (transport != null) transport.Dispose();
         }
     }
 }
