@@ -18,6 +18,7 @@ namespace DellG15FanControl
         private int busy;
         private volatile bool exiting;
         private volatile bool systemEnding;
+        private volatile bool logoffEnding;
         private bool thermalOverride;
         private FanState? selectedManualState;
         private Telemetry lastTelemetry;
@@ -407,14 +408,19 @@ namespace DellG15FanControl
 
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
-            systemEnding = true;
-            Program.SuppressWatchdogRestore();
+            if (e.Reason == SessionEndReasons.SystemShutdown)
+            {
+                systemEnding = true;
+                Program.SuppressWatchdogRestore();
+            }
+            else
+                logoffEnding = true;
         }
 
         private void OnClosing(object sender, FormClosingEventArgs e)
         {
-            bool windowsShutdown = systemEnding || e.CloseReason == CloseReason.WindowsShutDown;
-            if (!allowExit && !windowsShutdown && e.CloseReason == CloseReason.UserClosing)
+            bool windowsShutdown = systemEnding || (e.CloseReason == CloseReason.WindowsShutDown && !logoffEnding);
+            if (!allowExit && !windowsShutdown && !logoffEnding && e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
                 HideToTray();
@@ -443,14 +449,17 @@ namespace DellG15FanControl
             catch (Exception ex)
             {
                 restored = false;
-                DialogResult result = MessageBox.Show(T("恢复 BIOS 自动失败：", "Failed to restore BIOS Auto: ") + ex.Message + "\n" +
-                    T("仍要退出吗？看门狗还会重试。", "Exit anyway? The watchdog will retry."), Text, MessageBoxButtons.YesNo, MessageBoxIcon.Error);
-                if (result == DialogResult.No)
+                if (!logoffEnding)
                 {
-                    e.Cancel = true;
-                    exiting = false;
-                    timer.Start();
-                    return;
+                    DialogResult result = MessageBox.Show(T("恢复 BIOS 自动失败：", "Failed to restore BIOS Auto: ") + ex.Message + "\n" +
+                        T("仍要退出吗？看门狗还会重试。", "Exit anyway? The watchdog will retry."), Text, MessageBoxButtons.YesNo, MessageBoxIcon.Error);
+                    if (result == DialogResult.No)
+                    {
+                        e.Cancel = true;
+                        exiting = false;
+                        timer.Start();
+                        return;
+                    }
                 }
             }
 
