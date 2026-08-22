@@ -235,6 +235,13 @@ try {
             catch { return line; }
         }
 
+        internal void Abort()
+        {
+            Process current = process;
+            if (current == null) return;
+            try { if (!current.HasExited) current.Kill(); } catch { }
+        }
+
         public void Dispose()
         {
             lock (gate)
